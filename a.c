@@ -18,12 +18,20 @@
 #include <errno.h>
 #include <stdarg.h>
 
+/*
+ Configuration
+ Add FULLSCREEN = 1 to make the bar span full screen width (simple line/bar).
+ 0 means disabled (default centered dock mode).
+ You can also set environment variable XSTATUS_FULLSCREEN to 1/0 to override.
+*/
 #define DEFAULT_FONT "xterm-12"
 #define DEFAULT_BG "#ffffff"
 #define DEFAULT_FG "#000000"
 #define DEFAULT_FOCUS_BG "#1e90ff"
 #define DEFAULT_WS_COUNT 9
 #define DEFAULT_CMD "date '+%a %b %d %H:%M:%S'"
+
+#define FULLSCREEN 1
 
 #define MAX_TEXT 512
 #define PADDING 8
@@ -120,6 +128,7 @@ static const char *g_cmd = NULL;
 static const char *g_switch_fmt = NULL;
 static GC g_gc_bg = NULL;
 static GC g_gc_focus = NULL;
+static int g_fullscreen = FULLSCREEN;
 
 /* forward */
 static void draw_all(void);
@@ -158,6 +167,7 @@ static void do_switch(int ws) {
 }
 
 /* draw_all: recompute content width, resize window centered, draw tags and status */
+/* draw_all: recompute content width, resize window centered, draw tags and status */
 static void draw_all(void) {
     if (!g_dpy) return;
 
@@ -166,7 +176,7 @@ static void draw_all(void) {
         FILE *f = popen(g_cmd, "r");
         if (f) {
             if (fgets(status_text, sizeof(status_text), f)) {
-                size_t L = strlen(status_text); 
+                size_t L = strlen(status_text);
                 if (L && status_text[L-1] == '\n') status_text[L-1] = '\0';
             } else status_text[0] = '\0';
             pclose(f);
@@ -213,7 +223,7 @@ static void draw_all(void) {
     for (int i = 1; i <= g_ws_count; ++i) {
         if (!occupied[i]) continue;
 
-        char tb[4]; 
+        char tb[4];
         snprintf(tb, sizeof(tb), "%d", i);
         XGlyphInfo ginfo;
         XftTextExtentsUtf8(g_dpy, g_font, (FcChar8*)tb, strlen(tb), &ginfo);
@@ -235,10 +245,16 @@ static void draw_all(void) {
     int content_w = left_width + status_w + PADDING * 2;
     if (content_w < 200) content_w = 200;
 
-    /* center on top */
+    /* center on top, unless fullscreen is enabled */
     g_screen_w = DisplayWidth(g_dpy, g_scr);
     int win_x = (g_screen_w - content_w) / 2;
     if (win_x < 0) win_x = 0;
+
+    if (g_fullscreen) {
+        content_w = g_screen_w;
+        win_x = 0;
+    }
+
     XMoveResizeWindow(g_dpy, g_win, win_x, 0, content_w, g_bar_h);
     XSync(g_dpy, False);
 
@@ -249,7 +265,7 @@ static void draw_all(void) {
     int text_y = g_font->ascent + (g_bar_h - (g_font->ascent + g_font->descent)) / 2;
     for (int i = 0; i < g_tagrects_n; ++i) {
         int tag = g_tagrects[i].tag;
-        char tb[4]; 
+        char tb[4];
         snprintf(tb, sizeof(tb), "%d", tag);
         int tx = g_tagrects[i].x;
         int w = g_tagrects[i].w;
@@ -258,29 +274,46 @@ static void draw_all(void) {
             /* focus bg */
             int ry = (g_bar_h - (g_font->ascent + g_font->descent)) / 2 - 2;
             if (ry < 0) ry = 0;
-            XFillRectangle(g_dpy, g_win, g_gc_focus, tx - 2, ry, w + 4, 
+            XFillRectangle(g_dpy, g_win, g_gc_focus, tx - 2, ry, w + 4,
                           g_font->ascent + g_font->descent + 4);
-            XftDrawStringUtf8(g_draw, &g_xft_focus_text, g_font, 
-                             tx + TAG_PADDING / 2, text_y, 
+            XftDrawStringUtf8(g_draw, &g_xft_focus_text, g_font,
+                             tx + TAG_PADDING / 2, text_y,
                              (FcChar8*)tb, strlen(tb));
         } else {
-            XftDrawStringUtf8(g_draw, &g_xft_fg, g_font, 
-                             tx + TAG_PADDING / 2, text_y, 
+            XftDrawStringUtf8(g_draw, &g_xft_fg, g_font,
+                             tx + TAG_PADDING / 2, text_y,
                              (FcChar8*)tb, strlen(tb));
         }
     }
 
-    /* draw status centered in remaining area */
-    int status_x = left_width + PADDING;
-    int inner_w = content_w - left_width - PADDING;
-    int status_off = 0;
-    if (status_w < inner_w) status_off = (inner_w - status_w) / 2;
+    /* draw status:
+       - if fullscreen: center in the whole window
+       - otherwise: center in the remaining area to the right of tags (old behavior)
+    */
+    int status_x = 0;
 
-    XftDrawStringUtf8(g_draw, &g_xft_shadow, g_font, 
-                     status_x + status_off + 1, text_y + 1, 
+    if (g_fullscreen) {
+        status_x = (content_w - status_w) / 2;
+    } else {
+        int base_x = left_width + PADDING;
+        int inner_w = content_w - left_width - PADDING;
+        int status_off = 0;
+        if (status_w < inner_w) status_off = (inner_w - status_w) / 2;
+        status_x = base_x + status_off;
+    }
+
+    /* clamp so text doesn't draw off-window */
+    if (status_x < 0) status_x = 0;
+    if (status_x + status_w > content_w) {
+        if (status_w >= content_w) status_x = 0;
+        else status_x = content_w - status_w;
+    }
+
+    XftDrawStringUtf8(g_draw, &g_xft_shadow, g_font,
+                     status_x + 1, text_y + 1,
                      (FcChar8*)status_text, strlen(status_text));
-    XftDrawStringUtf8(g_draw, &g_xft_fg, g_font, 
-                     status_x + status_off, text_y, 
+    XftDrawStringUtf8(g_draw, &g_xft_fg, g_font,
+                     status_x, text_y,
                      (FcChar8*)status_text, strlen(status_text));
     XFlush(g_dpy);
 }
@@ -296,6 +329,12 @@ int main(void) {
     g_ws_count = atoi(env_or("XSTATUS_WS_COUNT", "9"));
     if (g_ws_count <= 0) g_ws_count = DEFAULT_WS_COUNT;
     if (g_ws_count > MAX_WS) g_ws_count = MAX_WS;
+
+    /* allow env override for fullscreen */
+    {
+        const char *fsenv = getenv("XSTATUS_FULLSCREEN");
+        if (fsenv) g_fullscreen = atoi(fsenv);
+    }
 
     /* paths */
     const char *home = getenv("HOME");
