@@ -1,5 +1,4 @@
-// Optimized X11 status bar with reduced memory usage
-// Shows all occupied workspaces (accepts formats like "1,2,3" or "1 2 3")
+// statusbar-hsdwm
 
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
@@ -166,7 +165,6 @@ static void do_switch(int ws) {
     system(try2);
 }
 
-/* draw_all: recompute content width, resize window centered, draw tags and status */
 /* draw_all: recompute content width, resize window centered, draw tags and status */
 static void draw_all(void) {
     if (!g_dpy) return;
@@ -341,19 +339,19 @@ int main(void) {
     if (home) {
         snprintf(g_focused_path, sizeof(g_focused_path), "%s/.wm/focused.workspace", home);
         snprintf(g_occupied_path, sizeof(g_occupied_path), "%s/.wm/occupied.workspace", home);
-    } else { 
-        g_focused_path[0] = g_occupied_path[0] = 0; 
+    } else {
+        g_focused_path[0] = g_occupied_path[0] = 0;
     }
 
     /* inotify */
     int inofd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     int watch_focused = -1, watch_occupied = -1;
     if (inofd >= 0) {
-        if (g_focused_path[0]) 
-            watch_focused = inotify_add_watch(inofd, g_focused_path, 
+        if (g_focused_path[0])
+            watch_focused = inotify_add_watch(inofd, g_focused_path,
                                             IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM);
-        if (g_occupied_path[0]) 
-            watch_occupied = inotify_add_watch(inofd, g_occupied_path, 
+        if (g_occupied_path[0])
+            watch_occupied = inotify_add_watch(inofd, g_occupied_path,
                                              IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM);
     }
 
@@ -364,25 +362,25 @@ int main(void) {
     g_root = RootWindow(g_dpy, g_scr);
     g_cmap = DefaultColormap(g_dpy, g_scr);
     g_screen_w = DisplayWidth(g_dpy, g_scr);
-    g_bar_h = atoi(env_or("XSTATUS_HEIGHT", "28")); 
+    g_bar_h = atoi(env_or("XSTATUS_HEIGHT", "28"));
     if (g_bar_h <= 0) g_bar_h = 28;
 
     /* colors */
-    if (!parse_color(g_dpy, g_cmap, bg_spec, &g_xc_bg)) { 
-        g_xc_bg.red = g_xc_bg.green = g_xc_bg.blue = 0xffff; 
-        g_bg_pixel = WhitePixel(g_dpy, g_scr); 
+    if (!parse_color(g_dpy, g_cmap, bg_spec, &g_xc_bg)) {
+        g_xc_bg.red = g_xc_bg.green = g_xc_bg.blue = 0xffff;
+        g_bg_pixel = WhitePixel(g_dpy, g_scr);
     } else {
         g_bg_pixel = g_xc_bg.pixel;
     }
-    
-    if (!parse_color(g_dpy, g_cmap, fg_spec, &g_xc_fg)) 
+
+    if (!parse_color(g_dpy, g_cmap, fg_spec, &g_xc_fg))
         g_xc_fg.red = g_xc_fg.green = g_xc_fg.blue = 0x0000;
-    
-    if (!parse_color(g_dpy, g_cmap, focus_spec, &g_xc_focus)) { 
-        g_xc_focus.red = 0x1e00; 
-        g_xc_focus.green = 0x9000; 
-        g_xc_focus.blue = 0xff00; 
-        XAllocColor(g_dpy, g_cmap, &g_xc_focus); 
+
+    if (!parse_color(g_dpy, g_cmap, focus_spec, &g_xc_focus)) {
+        g_xc_focus.red = 0x1e00;
+        g_xc_focus.green = 0x9000;
+        g_xc_focus.blue = 0xff00;
+        XAllocColor(g_dpy, g_cmap, &g_xc_focus);
     }
 
     /* Xft font + colors */
@@ -390,81 +388,106 @@ int main(void) {
     g_font = XftFontOpenName(g_dpy, g_scr, fontname);
     if (!g_font) g_font = XftFontOpenName(g_dpy, g_scr, "xterm-12");
     if (!g_font) g_font = XftFontOpenName(g_dpy, g_scr, "monospace-12");
-    if (!g_font) { 
-        fprintf(stderr, "failed to open Xft font; try installing fonts or set XSTATUS_FONT to a valid Fc name\n"); 
-        XCloseDisplay(g_dpy); 
-        return 1; 
+    if (!g_font) {
+        fprintf(stderr, "failed to open Xft font; try installing fonts or set XSTATUS_FONT to a valid Fc name\n");
+        XCloseDisplay(g_dpy);
+        return 1;
     }
 
-    XRenderColor rc_fg = { 
-        (unsigned short)g_xc_fg.red, 
-        (unsigned short)g_xc_fg.green, 
-        (unsigned short)g_xc_fg.blue, 
-        0xffff 
+    XRenderColor rc_fg = {
+        (unsigned short)g_xc_fg.red,
+        (unsigned short)g_xc_fg.green,
+        (unsigned short)g_xc_fg.blue,
+        0xffff
     };
-    
-    if (!XftColorAllocValue(g_dpy, vis, g_cmap, &rc_fg, &g_xft_fg)) { 
-        XRenderColor fb = {0, 0, 0, 0xffff}; 
-        XftColorAllocValue(g_dpy, vis, g_cmap, &fb, &g_xft_fg); 
+
+    if (!XftColorAllocValue(g_dpy, vis, g_cmap, &rc_fg, &g_xft_fg)) {
+        XRenderColor fb = {0, 0, 0, 0xffff};
+        XftColorAllocValue(g_dpy, vis, g_cmap, &fb, &g_xft_fg);
     }
 
     XRenderColor rc_sh;
-    if ((rc_fg.red > 0x7fff) && (rc_fg.green > 0x7fff) && (rc_fg.blue > 0x7fff)) 
+    if ((rc_fg.red > 0x7fff) && (rc_fg.green > 0x7fff) && (rc_fg.blue > 0x7fff))
         rc_sh.red = rc_sh.green = rc_sh.blue = 0x0000;
-    else 
+    else
         rc_sh.red = rc_sh.green = rc_sh.blue = 0xffff;
-    
+
     rc_sh.alpha = 0x8000;
     XftColorAllocValue(g_dpy, vis, g_cmap, &rc_sh, &g_xft_shadow);
 
     double lum_focus = lum_from_xcolor(&g_xc_focus);
     XRenderColor rc_focus_text;
-    if (lum_focus > 0.5) 
+    if (lum_focus > 0.5)
         rc_focus_text.red = rc_focus_text.green = rc_focus_text.blue = 0x0000;
-    else 
+    else
         rc_focus_text.red = rc_focus_text.green = rc_focus_text.blue = 0xffff;
-    
+
     rc_focus_text.alpha = 0xffff;
     XftColorAllocValue(g_dpy, vis, g_cmap, &rc_focus_text, &g_xft_focus_text);
 
-    /* create window (small width initially) */
+    /* create window (small width initially)
+       note: override_redirect = False so the wm will manage it as a dock
+    */
     XSetWindowAttributes wa;
-    wa.override_redirect = True;
+    wa.override_redirect = False;   /* allow wm to manage dock */
     wa.background_pixel = 0; /* we draw content area ourselves */
     wa.event_mask = ExposureMask | ButtonPressMask | StructureNotifyMask;
     g_win = XCreateWindow(g_dpy, g_root, 0, 0, 200, g_bar_h, 0, DefaultDepth(g_dpy, g_scr),
                           CopyFromParent, DefaultVisual(g_dpy, g_scr),
-                          CWOverrideRedirect | CWBackPixel | CWEventMask, &wa);
+                          CWBackPixel | CWEventMask, &wa);
 
-    /* hint dock */
+    /* set ewmh hints before mapping */
     Atom a_type = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE", False);
     Atom a_type_dock = XInternAtom(g_dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
-    if (a_type && a_type_dock) 
-        XChangeProperty(g_dpy, g_win, a_type, XA_ATOM, 32, PropModeReplace, 
+    if (a_type && a_type_dock)
+        XChangeProperty(g_dpy, g_win, a_type, XA_ATOM, 32, PropModeReplace,
                        (unsigned char *)&a_type_dock, 1);
+
+    /* set states: above + sticky (so it behaves like polybar) */
+    Atom a_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
+    Atom a_state_above = XInternAtom(g_dpy, "_NET_WM_STATE_ABOVE", False);
+    Atom a_state_sticky = XInternAtom(g_dpy, "_NET_WM_STATE_STICKY", False);
+    Atom states[2];
+    int nstates = 0;
+    if (a_state_above) states[nstates++] = a_state_above;
+    if (a_state_sticky) states[nstates++] = a_state_sticky;
+    if (nstates && a_state)
+        XChangeProperty(g_dpy, g_win, a_state, XA_ATOM, 32, PropModeReplace,
+                        (unsigned char*)states, nstates);
+
+    /* optional: set pid for nicer wm debugging */
+    Atom a_pid = XInternAtom(g_dpy, "_NET_WM_PID", False);
+    if (a_pid) {
+        unsigned long pid = (unsigned long)getpid();
+        XChangeProperty(g_dpy, g_win, a_pid, XA_CARDINAL, 32, PropModeReplace,
+                        (unsigned char*)&pid, 1);
+    }
 
     /* Create GCs once for reuse */
     g_gc_bg = XCreateGC(g_dpy, g_win, 0, NULL);
     XSetForeground(g_dpy, g_gc_bg, g_bg_pixel);
-    
+
     g_gc_focus = XCreateGC(g_dpy, g_win, 0, NULL);
     XSetForeground(g_dpy, g_gc_focus, g_xc_focus.pixel);
 
     /* Xft draw binding */
     g_draw = XftDrawCreate(g_dpy, g_win, vis, g_cmap);
 
-    XMapRaised(g_dpy, g_win);
+    /* set strut so the wm reserves the top area */
     set_strut(g_dpy, g_win, g_bar_h);
+
+    /* map normally so WM can manage stacking */
+    XMapWindow(g_dpy, g_win);
 
     /* poll fds: X connection + inotify (if available) */
     struct pollfd pfds[2];
-    pfds[0].fd = ConnectionNumber(g_dpy); 
+    pfds[0].fd = ConnectionNumber(g_dpy);
     pfds[0].events = POLLIN;
     int nfds = 1;
-    if (inofd >= 0) { 
-        pfds[1].fd = inofd; 
-        pfds[1].events = POLLIN; 
-        nfds = 2; 
+    if (inofd >= 0) {
+        pfds[1].fd = inofd;
+        pfds[1].events = POLLIN;
+        nfds = 2;
     }
 
     /* initial draw */
