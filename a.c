@@ -1,4 +1,5 @@
-// statusbar-hsdwm (hardcoded config; no env vars)
+// statusbar-hsdwm (hardcoded config; cleaned up + color-fix)
+// full version pasted into chat as requested by hsd
 
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
@@ -22,19 +23,16 @@
    edit these values directly
    -------------------------*/
 
-#define HARD_FONT "xterm-12"
-#define HARD_BG "#ffffff"
-#define HARD_FG "#000000"
-#define HARD_FOCUS_BG "#1e90ff"
-#define HARD_WS_COUNT 9
-#define HARD_CMD "date '+%a %b %d %H:%M:%S'"
+#define HARD_FONT      "xterm-12"
+#define HARD_BG        "#ffffff"
+#define HARD_FG        "#000000"
+#define HARD_FOCUS_BG  "#1e90ff"
+#define HARD_WS_COUNT  9
+#define HARD_CMD       "date '+%a %b %d %H:%M:%S'"
 #define HARD_FULLSCREEN 1
 #define HARD_BAR_HEIGHT 28
-#define HARD_INTERVAL 1 /* seconds */
+#define HARD_INTERVAL   1 /* seconds */
 
-/* right commands: change these to whatever you want
-   separate each entry as its own string
-   note: keep commands cheap because they run each tick */
 #define RIGHT_CMD_COUNT 2
 static const char *RIGHT_CMDS[RIGHT_CMD_COUNT] = {
     "uptime",
@@ -79,6 +77,7 @@ static int g_right_cmds_n = 0;
 /* forward */
 static void draw_all(void);
 static void do_switch(int ws);
+static void set_strut(Display *dpy, Window win, int top);   /* prototype for set_strut */
 
 /* helper run system with formatted string (safe-ish) */
 static void run_format(const char *fmt, ...) {
@@ -131,10 +130,32 @@ static double lum_from_xcolor(const XColor *xc) {
     return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
+/* convenience: allocate an XftColor from an XColor; returns 1 on success */
+static int alloc_xft_from_xcolor(Display *dpy, Visual *vis, Colormap cmap, const XColor *xc, XftColor *out) {
+    XRenderColor rc;
+    rc.red   = (unsigned short)xc->red;
+    rc.green = (unsigned short)xc->green;
+    rc.blue  = (unsigned short)xc->blue;
+    rc.alpha = 0xffff;
+    if (XftColorAllocValue(dpy, vis, cmap, &rc, out)) return 1;
+
+    /* fallback: try pure black or white based on xc brightness */
+    double lum = lum_from_xcolor(xc);
+    if (lum > 0.5) {
+        XRenderColor rb = { 0, 0, 0, 0xffff };
+        return XftColorAllocValue(dpy, vis, cmap, &rb, out);
+    } else {
+        XRenderColor rw = { 0xffff, 0xffff, 0xffff, 0xffff };
+        return XftColorAllocValue(dpy, vis, cmap, &rw, out);
+    }
+}
+
+/* implementation: set _NET_WM_STRUT and _NET_WM_STRUT_PARTIAL so the dock reserves space */
 static void set_strut(Display *dpy, Window win, int top) {
     Atom a_strut = XInternAtom(dpy, "_NET_WM_STRUT", False);
     Atom a_strut_partial = XInternAtom(dpy, "_NET_WM_STRUT_PARTIAL", False);
     if (!a_strut || !a_strut_partial) return;
+
     long strut[4] = {0, 0, top, 0};
     long partial[12] = {0};
     partial[2] = top;
@@ -417,6 +438,7 @@ int main(void) {
     g_bar_h = HARD_BAR_HEIGHT;
     if (g_bar_h <= 0) g_bar_h = 28;
 
+    /* parse background first */
     if (!parse_color(g_dpy, g_cmap, bg_spec, &g_xc_bg)) {
         g_xc_bg.red = g_xc_bg.green = g_xc_bg.blue = 0xffff;
         g_bg_pixel = WhitePixel(g_dpy, g_scr);
@@ -424,9 +446,18 @@ int main(void) {
         g_bg_pixel = g_xc_bg.pixel;
     }
 
-    if (!parse_color(g_dpy, g_cmap, fg_spec, &g_xc_fg))
-        g_xc_fg.red = g_xc_fg.green = g_xc_fg.blue = 0x0000;
+    /* parse foreground; if parsing fails, pick a contrasting fg based on background luminance */
+    if (!parse_color(g_dpy, g_cmap, fg_spec, &g_xc_fg)) {
+        double lum_bg = lum_from_xcolor(&g_xc_bg);
+        if (lum_bg > 0.5) {
+            g_xc_fg.red = g_xc_fg.green = g_xc_fg.blue = 0x0000; /* dark text on light bg */
+        } else {
+            g_xc_fg.red = g_xc_fg.green = g_xc_fg.blue = 0xffff; /* light text on dark bg */
+        }
+        XAllocColor(g_dpy, g_cmap, &g_xc_fg);
+    }
 
+    /* parse focus color, fallback to a sane blue-ish if missing */
     if (!parse_color(g_dpy, g_cmap, focus_spec, &g_xc_focus)) {
         g_xc_focus.red = 0x1e00;
         g_xc_focus.green = 0x9000;
@@ -435,6 +466,7 @@ int main(void) {
     }
 
     Visual *vis = DefaultVisual(g_dpy, g_scr);
+
     g_font = XftFontOpenName(g_dpy, g_scr, fontname);
     if (!g_font) g_font = XftFontOpenName(g_dpy, g_scr, "xterm-12");
     if (!g_font) g_font = XftFontOpenName(g_dpy, g_scr, "monospace-12");
@@ -444,26 +476,25 @@ int main(void) {
         return 1;
     }
 
-    XRenderColor rc_fg = {
-        (unsigned short)g_xc_fg.red,
-        (unsigned short)g_xc_fg.green,
-        (unsigned short)g_xc_fg.blue,
-        0xffff
-    };
-
-    if (!XftColorAllocValue(g_dpy, vis, g_cmap, &rc_fg, &g_xft_fg)) {
-        XRenderColor fb = {0, 0, 0, 0xffff};
-        XftColorAllocValue(g_dpy, vis, g_cmap, &fb, &g_xft_fg);
+    /* allocate Xft colors with safer fallbacks */
+    if (!alloc_xft_from_xcolor(g_dpy, vis, g_cmap, &g_xc_fg, &g_xft_fg)) {
+        /* last resort: black */
+        XRenderColor rb = { 0, 0, 0, 0xffff };
+        XftColorAllocValue(g_dpy, vis, g_cmap, &rb, &g_xft_fg);
     }
 
+    double lum_fg = lum_from_xcolor(&g_xc_fg);
     XRenderColor rc_sh;
-    if ((rc_fg.red > 0x7fff) && (rc_fg.green > 0x7fff) && (rc_fg.blue > 0x7fff))
-        rc_sh.red = rc_sh.green = rc_sh.blue = 0x0000;
+    if (lum_fg > 0.5)
+        rc_sh.red = rc_sh.green = rc_sh.blue = 0; /* dark shadow for light foreground */
     else
-        rc_sh.red = rc_sh.green = rc_sh.blue = 0xffff;
-
+        rc_sh.red = rc_sh.green = rc_sh.blue = 0xffff; /* light shadow for dark foreground */
     rc_sh.alpha = 0x8000;
-    XftColorAllocValue(g_dpy, vis, g_cmap, &rc_sh, &g_xft_shadow);
+    if (!XftColorAllocValue(g_dpy, vis, g_cmap, &rc_sh, &g_xft_shadow)) {
+        /* fallback */
+        XRenderColor rb = { 0, 0, 0, 0xffff };
+        XftColorAllocValue(g_dpy, vis, g_cmap, &rb, &g_xft_shadow);
+    }
 
     double lum_focus = lum_from_xcolor(&g_xc_focus);
     XRenderColor rc_focus_text;
@@ -471,13 +502,12 @@ int main(void) {
         rc_focus_text.red = rc_focus_text.green = rc_focus_text.blue = 0x0000;
     else
         rc_focus_text.red = rc_focus_text.green = rc_focus_text.blue = 0xffff;
-
     rc_focus_text.alpha = 0xffff;
     XftColorAllocValue(g_dpy, vis, g_cmap, &rc_focus_text, &g_xft_focus_text);
 
     XSetWindowAttributes wa;
     wa.override_redirect = False;
-    wa.background_pixel = 0;
+    wa.background_pixel = g_bg_pixel; /* ensure window background matches requested bg */
     wa.event_mask = ExposureMask | ButtonPressMask | StructureNotifyMask;
     g_win = XCreateWindow(g_dpy, g_root, 0, 0, 200, g_bar_h, 0, DefaultDepth(g_dpy, g_scr),
                           CopyFromParent, DefaultVisual(g_dpy, g_scr),
