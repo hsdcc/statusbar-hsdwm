@@ -1,5 +1,6 @@
 // statusbar-hsdwm (hardcoded config; cleaned up + color-fix)
-// full version pasted into chat as requested by hsd
+// if the command stays alive we read lines as they come
+// if it exits we respawn after HARD_INTERVAL seconds
 
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
@@ -8,6 +9,8 @@
 #include <X11/Xft/Xft.h>
 #include <sys/inotify.h>
 #include <sys/poll.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +20,11 @@
 #include <math.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <time.h>
+
+#if !defined(MAX)
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
 
 /* -------------------------
    hardcoded configuration
@@ -74,10 +82,20 @@ static int g_fullscreen = HARD_FULLSCREEN;
 static char *g_right_cmds[MAX_RIGHT_CMDS];
 static int g_right_cmds_n = 0;
 
+/* status command runtime state */
+static pid_t g_cmd_pid = -1;
+static int g_cmd_fd = -1; /* read end */
+static char g_status_line[MAX_TEXT] = "";
+static char g_cmd_readbuf[4096];
+static size_t g_cmd_readpos = 0;
+static time_t g_next_spawn = 0;
+
 /* forward */
 static void draw_all(void);
 static void do_switch(int ws);
-static void set_strut(Display *dpy, Window win, int top);   /* prototype for set_strut */
+static void set_strut(Display *dpy, Window win, int top);
+static int spawn_status_cmd(void);
+static void stop_status_cmd_and_schedule_restart(int status_interval);
 
 /* helper run system with formatted string (safe-ish) */
 static void run_format(const char *fmt, ...) {
@@ -101,6 +119,7 @@ static void run_cmd_to_buf(const char *cmd, char *out, size_t outlen) {
     pclose(f);
 }
 
+/* eWMH current desktop */
 static int get_ewmh_current_desktop(Display *dpy) {
     Atom a = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
     if (!a) return -1;
@@ -182,20 +201,128 @@ static void do_switch(int ws) {
     system(try2);
 }
 
-/* draw_all: recompute content width, resize window centered, draw tags, status, and right modules */
+/* spawn the status command with a pipe, nonblocking read end */
+static int spawn_status_cmd(void) {
+    if (!g_cmd || !g_cmd[0]) return 0;
+    int p[2];
+    if (pipe(p) < 0) {
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(p[0]); close(p[1]);
+        return 0;
+    }
+
+    if (pid == 0) {
+        /* child */
+        /* detach stdout (and stderr) to the pipe */
+        close(p[0]);
+        if (dup2(p[1], STDOUT_FILENO) < 0) _exit(127);
+        if (dup2(p[1], STDERR_FILENO) < 0) { /* ignore */ }
+        close(p[1]);
+
+        /* ensure we don't inherit fds we shouldn't - optional, but good */
+        for (int fd = 3; fd < 256; ++fd) close(fd);
+
+        /* run via sh -c */
+        execl("/bin/sh", "sh", "-c", g_cmd, (char*)NULL);
+        _exit(127);
+    }
+
+    /* parent */
+    close(p[1]);
+    /* make nonblocking */
+    int flags = fcntl(p[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(p[0], F_SETFL, flags | O_NONBLOCK);
+
+    g_cmd_pid = pid;
+    g_cmd_fd = p[0];
+    g_cmd_readpos = 0;
+    g_cmd_readbuf[0] = '\0';
+    g_status_line[0] = '\0';
+    return 1;
+}
+
+/* stop existing cmd (if any) and schedule restart after interval seconds */
+static void stop_status_cmd_and_schedule_restart(int status_interval) {
+    if (g_cmd_fd >= 0) {
+        close(g_cmd_fd);
+        g_cmd_fd = -1;
+    }
+    if (g_cmd_pid > 0) {
+        int st = 0;
+        waitpid(g_cmd_pid, &st, WNOHANG);
+        g_cmd_pid = -1;
+    }
+    g_next_spawn = time(NULL) + (status_interval > 0 ? status_interval : 1);
+}
+
+/* internal helper to process bytes read from cmd pipe and update g_status_line when we have a full line */
+static void process_cmd_bytes(const char *buf, ssize_t n) {
+    if (!buf || n <= 0) return;
+    size_t space = sizeof(g_cmd_readbuf) - g_cmd_readpos - 1;
+    if ((size_t)n > space) n = (ssize_t)space;
+    memcpy(g_cmd_readbuf + g_cmd_readpos, buf, n);
+    g_cmd_readpos += n;
+    g_cmd_readbuf[g_cmd_readpos] = '\0';
+
+    /* extract last full line (up to newline) */
+    char *last_nl = strrchr(g_cmd_readbuf, '\n');
+    if (!last_nl) {
+        /* no newline yet, don't update g_status_line (unless buffer too full) */
+        if (g_cmd_readpos >= sizeof(g_cmd_readbuf) - 2) {
+            /* force update with what we have */
+            size_t L = g_cmd_readpos;
+            if (L >= sizeof(g_status_line)) L = sizeof(g_status_line) - 1;
+            memcpy(g_status_line, g_cmd_readbuf, L);
+            g_status_line[L] = '\0';
+            /* reset buffer */
+            g_cmd_readpos = 0;
+            g_cmd_readbuf[0] = '\0';
+        }
+        return;
+    }
+
+    /* take the last full line: find previous newline (or start) */
+    char *prev = last_nl;
+    if (prev != g_cmd_readbuf) {
+        char *p = prev - 1;
+        while (p >= g_cmd_readbuf && *p != '\n') --p;
+        if (p >= g_cmd_readbuf && *p == '\n') prev = p + 1;
+        else prev = g_cmd_readbuf;
+    } else {
+        prev = g_cmd_readbuf;
+    }
+
+    /* copy the last full line (strip newline) */
+    size_t len = (size_t)(last_nl - prev);
+    if (len >= sizeof(g_status_line)) len = sizeof(g_status_line) - 1;
+    memcpy(g_status_line, prev, len);
+    g_status_line[len] = '\0';
+
+    /* if there is data after last_nl, shift it to the buffer start */
+    size_t remain = (size_t)(g_cmd_readpos - (last_nl - g_cmd_readbuf) - 1);
+    if (remain > 0) {
+        memmove(g_cmd_readbuf, last_nl + 1, remain);
+        g_cmd_readpos = remain;
+        g_cmd_readbuf[g_cmd_readpos] = '\0';
+    } else {
+        g_cmd_readpos = 0;
+        g_cmd_readbuf[0] = '\0';
+    }
+}
+
+/* ---------------- draw_all ---------------- */
 static void draw_all(void) {
     if (!g_dpy) return;
 
     char status_text[MAX_TEXT] = "";
-    if (g_cmd) {
-        FILE *f = popen(g_cmd, "r");
-        if (f) {
-            if (fgets(status_text, sizeof(status_text), f)) {
-                size_t L = strlen(status_text);
-                if (L && status_text[L-1] == '\n') status_text[L-1] = '\0';
-            } else status_text[0] = '\0';
-            pclose(f);
-        } else snprintf(status_text, sizeof(status_text), "(failed cmd)");
+    /* use the latest line we have from the spawned command */
+    if (g_status_line[0]) {
+        strncpy(status_text, g_status_line, sizeof(status_text)-1);
+        status_text[sizeof(status_text)-1] = '\0';
     }
 
     /* build right text by running each right cmd and joining with two spaces */
@@ -549,28 +676,54 @@ int main(void) {
 
     XMapWindow(g_dpy, g_win);
 
-    struct pollfd pfds[2];
-    pfds[0].fd = ConnectionNumber(g_dpy);
-    pfds[0].events = POLLIN;
-    int nfds = 1;
-    if (inofd >= 0) {
-        pfds[1].fd = inofd;
-        pfds[1].events = POLLIN;
-        nfds = 2;
-    }
+    /* initial spawn immediately */
+    g_cmd_fd = -1;
+    g_cmd_pid = -1;
+    g_next_spawn = 0;
+    spawn_status_cmd();
 
     draw_all();
 
-    int tick_ms = 100;
+    /* main loop - rebuild pollfds each iteration so we include cmd fd when present */
+    char inbuf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
     int status_interval = HARD_INTERVAL;
     if (status_interval <= 0) status_interval = 1;
-    int tick_counter = 0;
-    char inbuf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
 
     while (1) {
-        int timeout = tick_ms;
+        /* rebuild pollfds */
+        struct pollfd pfds[4];
+        int nfds = 0;
+        pfds[nfds].fd = ConnectionNumber(g_dpy);
+        pfds[nfds].events = POLLIN;
+        nfds++;
+
+        if (inofd >= 0) {
+            pfds[nfds].fd = inofd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        if (g_cmd_fd >= 0) {
+            pfds[nfds].fd = g_cmd_fd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        /* compute timeout: small tick to let X events be responsive */
+        int timeout = 200; /* ms */
+        /* if there's no running cmd, but next_spawn is in the past, spawn immediately */
+        time_t now = time(NULL);
+        if (g_cmd_fd < 0 && (g_next_spawn == 0 || now >= g_next_spawn)) {
+            spawn_status_cmd();
+            /* after spawn, redraw immediately */
+            draw_all();
+            continue;
+        }
+
         int ret = poll(pfds, nfds, timeout);
+
         if (ret > 0) {
+            /* handle X events first */
             if (pfds[0].revents & POLLIN) {
                 while (XPending(g_dpy)) {
                     XEvent ev;
@@ -590,17 +743,50 @@ int main(void) {
                     }
                 }
             }
-            if (nfds == 2 && (pfds[1].revents & POLLIN)) {
-                ssize_t len = read(inofd, inbuf, sizeof(inbuf));
-                (void)len;
-                draw_all();
+
+            /* handle inotify if present */
+            int idx = 1;
+            if (inofd < 0) idx = 1; /* skip */
+            if (inofd >= 0) {
+                if (pfds[1].revents & POLLIN) {
+                    ssize_t len = read(inofd, inbuf, sizeof(inbuf));
+                    (void)len;
+                    draw_all();
+                }
+                idx = 2;
+            }
+
+            /* handle cmd fd - it will be at pfds[idx] if present */
+            if (g_cmd_fd >= 0) {
+                int cmd_pfd_index = nfds - 1; /* it was appended last */
+                if (pfds[cmd_pfd_index].revents & (POLLIN | POLLHUP | POLLERR)) {
+                    char buf[1024];
+                    ssize_t r = read(g_cmd_fd, buf, sizeof(buf));
+                    if (r > 0) {
+                        process_cmd_bytes(buf, r);
+                        draw_all();
+                    } else if (r == 0) {
+                        /* EOF - command exited */
+                        stop_status_cmd_and_schedule_restart(status_interval);
+                        draw_all();
+                    } else {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            /* error - close and schedule restart */
+                            stop_status_cmd_and_schedule_restart(status_interval);
+                            draw_all();
+                        }
+                    }
+                }
             }
         } else if (ret == 0) {
-            tick_counter += tick_ms;
-            if (tick_counter >= status_interval * 1000) {
-                tick_counter = 0;
+            /* timeout */
+            /* if command isn't running we may need to spawn after next_spawn */
+            time_t now2 = time(NULL);
+            if (g_cmd_fd < 0 && g_next_spawn != 0 && now2 >= g_next_spawn) {
+                spawn_status_cmd();
                 draw_all();
             }
+            /* otherwise nothing to do; periodic redraw handled below */
         } else {
             if (errno == EINTR) continue;
             perror("poll");
@@ -608,6 +794,7 @@ int main(void) {
         }
     }
 
+    /* cleanup */
     if (g_draw) XftDrawDestroy(g_draw);
     if (g_font) XftFontClose(g_dpy, g_font);
     if (g_gc_bg) XFreeGC(g_dpy, g_gc_bg);
@@ -615,6 +802,11 @@ int main(void) {
     if (g_win) XDestroyWindow(g_dpy, g_win);
     if (g_dpy) XCloseDisplay(g_dpy);
     if (inofd >= 0) close(inofd);
+    if (g_cmd_fd >= 0) close(g_cmd_fd);
+    if (g_cmd_pid > 0) {
+        int st = 0;
+        waitpid(g_cmd_pid, &st, WNOHANG);
+    }
     for (int i = 0; i < g_right_cmds_n; ++i) if (g_right_cmds[i]) free(g_right_cmds[i]);
     return 0;
 }
